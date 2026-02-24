@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
@@ -8,6 +9,8 @@ import subprocess
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
+
+logger = logging.getLogger(__name__)
 
 import aiohttp
 import numpy as np
@@ -97,6 +100,9 @@ class LocalBackend(Backend):
 
     def _close(self) -> None:
         for _, service in self._services.items():
+            close = getattr(service, "close", None)
+            if close is not None:
+                close()
             close_proxy(service)
 
     async def register(
@@ -140,11 +146,29 @@ class LocalBackend(Backend):
 
         # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
         # Default to step 0 when not specified (the initial checkpoint created at registration)
-        actual_step = step if step is not None else self.__get_step(model)
-        return f"{model.name}@{actual_step}"
+        if step is not None:
+            actual_step = step
+        elif model.name in self._services:
+            # In dedicated mode the service tracks which adapter vLLM has
+            # actually loaded.  Reading the filesystem would race: the
+            # checkpoint directory appears before the HTTP reload completes.
+            svc = self._services[model.name]
+            loaded_step = getattr(svc, "_latest_step", None)
+            actual_step = (
+                loaded_step if loaded_step is not None else self.__get_step(model)
+            )
+        else:
+            actual_step = self.__get_step(model)
+        name = f"{model.name}@{actual_step}"
+        logger.debug(
+            f"[BACKEND] _model_inference_name: step_arg={step} "
+            f"actual_step={actual_step} -> {name}"
+        )
+        return name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
         if model.name not in self._services:
             config = get_model_config(
@@ -152,6 +176,9 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+
             is_tinker = config.get("tinker_args") is not None
             if is_tinker:
                 from ..tinker.service import TinkerService
@@ -164,13 +191,19 @@ class LocalBackend(Backend):
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
+
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(g) for g in config["trainer_gpu_ids"]
+                )
+
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
+            if not dedicated and not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
@@ -609,6 +642,10 @@ class LocalBackend(Backend):
             # Still advance the step by renaming the checkpoint directory
             current_step = self.__get_step(model)
             next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
             current_checkpoint_dir = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path), current_step
             )
@@ -623,8 +660,9 @@ class LocalBackend(Backend):
                     next_checkpoint_dir,
                     dirs_exist_ok=True,
                 )
-                print(
-                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                logger.info(
+                    f"[BACKEND] _train_model SKIP: copied checkpoint "
+                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
                 )
 
                 try:
@@ -634,6 +672,10 @@ class LocalBackend(Backend):
                         await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
                         )
+                    logger.info(
+                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
+                        f"completed for step {next_step}"
+                    )
                 except ModuleNotFoundError:
                     pass  # Unsloth is not installed
 
