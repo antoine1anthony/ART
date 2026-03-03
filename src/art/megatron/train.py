@@ -1,9 +1,18 @@
 # isort: off
 import os
 
+
+def _set_cache_dir(env_var: str, default_path: str) -> None:
+    if not os.environ.get(env_var):
+        os.environ[env_var] = os.path.expanduser(default_path)
+    os.makedirs(os.environ[env_var], exist_ok=True)
+
+
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+_set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
+_set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
 # isort: on
 
 import gc
@@ -21,9 +30,11 @@ from megatron.core.transformer.module import MegatronModule
 from pydantic import BaseModel
 from safetensors.torch import load_file, save_file
 import torch
+from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
 from art.megatron.provider import get_provider
@@ -54,6 +65,11 @@ model = provider.provide_distributed_model(
 
 rank = torch.distributed.get_rank()
 world_size = torch.distributed.get_world_size()
+
+if rank == 0:
+    print("TORCHINDUCTOR_CACHE_DIR:", os.environ["TORCHINDUCTOR_CACHE_DIR"])
+    print("Resolved inductor cache_dir():", inductor_cache_dir())
+    print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
 for module in model:
     while not isinstance(module, GPTModel) and hasattr(module, "module"):
@@ -120,31 +136,6 @@ def print0(*values: Any) -> None:
 
 
 offload_state = OffloadState()
-
-
-def calculate_mask(
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-) -> torch.Tensor:
-    causal_mask = (
-        torch.tril(
-            torch.ones(
-                seq_len,
-                seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-        )
-        .unsqueeze(0)
-        .expand(batch_size, seq_len, seq_len)
-    )
-    group_mask = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    mask = causal_mask & (group_mask | parent_mask)
-    return mask
 
 
 offload_to_cpu(model, optimizer, rank, offload_state)
@@ -236,26 +227,19 @@ while True:
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
                 inputs[key] = value.to(device)  # type: ignore
-        attention_mask = ~calculate_mask(
-            batch_size=inputs["tokens"].shape[0],
-            seq_len=inputs["tokens"].shape[1],
-            device=device,
+        attention_state = create_shared_prefix_attention_state(  # should happen after group_ids is moved to device
             group_ids=inputs["group_ids"],
             parent_ids=inputs["parent_ids"],
-        ).unsqueeze(1)  # add head dimension [B, H=1, S, S]
-        attention_bias = torch.where(
-            attention_mask,
-            torch.tensor(
-                float("-inf"), dtype=next(model[0].parameters()).dtype, device=device
-            ),
-            torch.tensor(0.0, dtype=next(model[0].parameters()).dtype, device=device),
         )
+        # Megatron full-layer recompute saves positional tensor args, so keep a tiny
+        # placeholder Tensor here and pass flex BlockMask state via attention_bias.
+        attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
         new_logprobs: torch.Tensor = -model[0](
             input_ids=inputs["tokens"],
             position_ids=inputs["input_pos"],
             attention_mask=attention_mask,
             labels=shift_tensor(inputs["tokens"], 0),
-            extra_block_kwargs={"attention_bias": attention_bias},
+            extra_block_kwargs={"attention_bias": attention_state},
         )
         loss = loss_fn(
             inputs,  # type: ignore
@@ -332,9 +316,11 @@ while True:
     offload_to_cpu(model, optimizer, rank, offload_state)
     # Release mmap-backed packed tensor references on all ranks before rank0 cleanup.
     del packed_tensors
+    del adapter_model
     if "inputs" in locals():
         del inputs
     gc.collect()
+    torch.cuda.empty_cache()
     # Ensure all ranks have finished saving before signaling completion
     torch.distributed.barrier()
     if rank == 0:
