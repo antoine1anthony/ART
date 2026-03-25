@@ -347,6 +347,48 @@ class TestTrackApiCost:
         )
 
     @pytest.mark.asyncio
+    async def test_explicit_model_name_uses_litellm_pricing_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import litellm
+
+        builder = MetricsBuilder(cost_context="train")
+
+        def _fake_get_model_info(model_name: str) -> dict[str, float]:
+            assert model_name == "openai/fallback-model"
+            return {
+                "input_cost_per_token": 2.5e-06,
+                "output_cost_per_token": 1.5e-05,
+                "cache_read_input_token_cost": 2.5e-07,
+            }
+
+        monkeypatch.setattr(litellm, "get_model_info", _fake_get_model_info)
+
+        @track_api_cost(
+            source="llm_judge/litellm_fallback",
+            provider="openai",
+            model_name="openai/fallback-model",
+        )
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=100,
+                completion_tokens=50,
+                cached_tokens=80,
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        expected = ((20 * 2.5) + (80 * 0.25) + (50 * 15.0)) / 1_000_000
+        assert metrics["costs/train/llm_judge/litellm_fallback"] == pytest.approx(
+            expected
+        )
+
+    @pytest.mark.asyncio
     async def test_explicit_model_name_does_not_depend_on_response_model(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 

@@ -57,10 +57,59 @@ MODEL_TOKEN_PRICING: dict[str, TokenPricing] = {
 }
 
 
+def _litellm_price_per_million(
+    model_info: Mapping[str, Any], field: str
+) -> float | None:
+    value = model_info.get(field)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+def _litellm_token_pricing(model_name: str) -> TokenPricing | None:
+    try:
+        from litellm import get_model_info
+
+        model_info = get_model_info(model_name)
+    except Exception:
+        return None
+
+    if not isinstance(model_info, Mapping):
+        return None
+
+    prompt_per_million = _litellm_price_per_million(model_info, "input_cost_per_token")
+    completion_per_million = _litellm_price_per_million(
+        model_info, "output_cost_per_token"
+    )
+    if prompt_per_million is None or completion_per_million is None:
+        return None
+
+    cache_read_per_million = _litellm_price_per_million(
+        model_info, "cache_read_input_token_cost"
+    )
+    cache_creation_per_million = _litellm_price_per_million(
+        model_info, "cache_creation_input_token_cost"
+    )
+    return TokenPricing(
+        prompt_per_million=prompt_per_million,
+        completion_per_million=completion_per_million,
+        cached_prompt_per_million=cache_read_per_million,
+        cache_creation_per_million=cache_creation_per_million,
+        cache_read_per_million=cache_read_per_million,
+    )
+
+
 def _configured_token_pricing(model_name: str) -> TokenPricing | None:
     explicit = MODEL_TOKEN_PRICING.get(model_name)
     if explicit is not None:
         return explicit
+
+    litellm_pricing = _litellm_token_pricing(model_name)
+    if litellm_pricing is not None:
+        return litellm_pricing
 
     pricing = get_model_pricing(model_name)
     if pricing is None:

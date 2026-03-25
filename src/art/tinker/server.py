@@ -7,7 +7,7 @@ import json
 import os
 import socket
 import time
-from typing import Annotated, AsyncGenerator, Literal
+from typing import Annotated, Any, AsyncGenerator, Literal, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
@@ -45,6 +45,47 @@ class ModelList(BaseModel):
 
 class ModelUpsert(BaseModel):
     target: str
+
+
+def _normalize_qwen3_5_messages(
+    base_model: str, messages: list[ChatCompletionMessageParam]
+) -> list[dict[str, Any]]:
+    normalized_messages = [cast(dict[str, Any], message) for message in messages]
+    if not base_model.startswith("Qwen/Qwen3.5"):
+        return normalized_messages
+    for i, message in enumerate(normalized_messages):
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        normalized_tool_calls: list[Any] = []
+        changed = False
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                normalized_tool_calls.append(tool_call)
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                normalized_tool_calls.append(tool_call)
+                continue
+            arguments_json = function.get("arguments")
+            if not isinstance(arguments_json, str):
+                normalized_tool_calls.append(tool_call)
+                continue
+            try:
+                arguments = json.loads(arguments_json)
+            except json.JSONDecodeError:
+                normalized_tool_calls.append(tool_call)
+                continue
+            if not isinstance(arguments, dict):
+                normalized_tool_calls.append(tool_call)
+                continue
+            changed = True
+            normalized_tool_calls.append(
+                {**tool_call, "function": {**function, "arguments": arguments}}
+            )
+        if changed:
+            normalized_messages[i] = {**message, "tool_calls": normalized_tool_calls}
+    return normalized_messages
 
 
 @dataclass
@@ -389,9 +430,10 @@ class OpenAICompatibleTinkerServerWorker:
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolUnionParam] | None,
     ) -> list[int]:
+        normalized_messages = _normalize_qwen3_5_messages(base_model, messages)
         encoding = self._get_renderer(base_model).tokenizer.apply_chat_template(
-            messages,  # type: ignore
-            tools=tools,  # type: ignore
+            cast(Any, normalized_messages),
+            tools=cast(Any, tools),
             add_generation_prompt=True,
         )
         if isinstance(encoding, BatchEncoding):

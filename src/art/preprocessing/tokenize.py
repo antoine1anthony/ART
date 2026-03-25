@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import takewhile
@@ -11,6 +12,22 @@ from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+
+ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
+
+
+def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | None:
+    if tools is None:
+        return None
+    normalized_tools: list[ChatTemplateTool] = []
+    for tool in tools:
+        if callable(tool):
+            normalized_tools.append(tool)
+        elif isinstance(tool, dict) and "type" in tool:
+            normalized_tools.append(cast(dict[Any, Any], tool))
+        else:
+            normalized_tools.append({"type": "function", "function": tool})
+    return normalized_tools
 
 
 @dataclass
@@ -199,11 +216,7 @@ def tokenize_trajectory(
         return None
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
     messages = get_messages(messages_and_choices)
-    tools: Any = (
-        [{"type": "function", "function": tool} for tool in history.tools]
-        if history.tools is not None
-        else None
-    )
+    tools = _normalize_tools_for_chat_template(history.tools)
     chat = cast(
         str,
         tokenizer.apply_chat_template(

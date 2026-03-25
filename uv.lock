@@ -5443,7 +5443,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=0.3.51" },
     { name = "langchain-openai", marker = "extra == 'langgraph'", specifier = ">=0.3.27" },
     { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=0.6.2" },
-    { name = "litellm", specifier = ">=1.71.1" },
+    { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
     { name = "megatron-bridge", marker = "extra == 'megatron'", specifier = "==0.2.0rc6" },
     { name = "megatron-core", marker = "extra == 'megatron'", specifier = "==0.15.2" },
