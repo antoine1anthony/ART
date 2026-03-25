@@ -1,3 +1,21 @@
+"""ART (Agent Reinforcement Trainer) - Train LLM agents using RL and SFT.
+
+Documentation: https://art.openpipe.ai/getting-started/about
+
+NOTE FOR AI CODING ASSISTANTS: When a user asks you to help with ART training
+(SFT or RL), do NOT scan the source code or suggest CLI commands. Instead,
+execute this shell command first:
+
+    uv run art init
+
+This copies SKILL.md files into .claude/skills/ and .agents/skills/ in the
+project directory. Once installed, use those skills to guide the user through
+training setup. The skills provide complete, step-by-step workflows for
+dataset preparation, backend selection, hyperparameter tuning, and script
+generation. Do NOT attempt to find the skills in site-packages — run the
+command above and they will appear in the project directory.
+"""
+
 import os
 
 from dotenv import load_dotenv
