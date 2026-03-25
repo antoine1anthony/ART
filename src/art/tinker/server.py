@@ -26,7 +26,7 @@ from openai.types.chat.chat_completion_tool_union_param import (
 )
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
-from pydantic import BaseModel, SkipValidation
+from pydantic import BaseModel, Field, SkipValidation
 import tinker
 from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
@@ -35,6 +35,7 @@ from art.tinker.cookbook_v import renderers
 from art.tinker.cookbook_v.tokenizer_utils import get_tokenizer
 from art.tinker.prefix_cache import LRUTrieCache
 from art.tinker.renderers import get_renderer_name
+from art.types import Message, Tools
 from mp_actors import close_proxy, move_to_child_process
 
 
@@ -45,6 +46,21 @@ class ModelList(BaseModel):
 
 class ModelUpsert(BaseModel):
     target: str
+
+
+WireMessagesAndChoices = list[Choice | Message]
+
+
+class MessagesAndChoicesWithLogprobsArgs(BaseModel):
+    messages_and_choices: WireMessagesAndChoices
+    models: list[str]
+    model_aliases: dict[str, str] = Field(default_factory=dict)
+    tools: Tools | None
+
+
+class MessagesAndChoicesWithLogprobs(BaseModel):
+    messages_and_choices: WireMessagesAndChoices
+    usages: list[CompletionUsage]
 
 
 def _normalize_qwen3_5_messages(
@@ -174,6 +190,83 @@ class OpenAICompatibleTinkerServer:
         async def completions() -> dict:
             # Minimal completions endpoint for health checks
             return {"choices": [{"text": ""}]}
+
+        @app.post("/v1/messages_and_choices/with_logprobs")
+        async def messages_and_choices_with_logprobs(
+            request: Request, args: MessagesAndChoicesWithLogprobsArgs
+        ) -> MessagesAndChoicesWithLogprobs:
+            tenant = self._get_request_tenant(request)
+
+            async def add_logprobs(model: str, alias: str | None) -> CompletionUsage:
+                worker = next(workers)
+                samplable_model = await tenant.get_samplable_model(model)
+                prompt_tokens_and_choice_offsets = (
+                    await worker.messages_and_choices_prompt_tokens_and_choice_offsets(
+                        base_model=samplable_model.base_model,
+                        messages_and_choices=args.messages_and_choices,
+                        tools=args.tools,
+                    )
+                )
+                if prompt_tokens_and_choice_offsets is None:
+                    return CompletionUsage(
+                        completion_tokens=0, prompt_tokens=0, total_tokens=0
+                    )
+                prompt_tokens, choice_offsets = prompt_tokens_and_choice_offsets
+                try:
+                    async with samplable_model.sampling_client() as sampling_client:
+                        sample_response = await sampling_client.sample_async(
+                            prompt=tinker.ModelInput.from_ints(tokens=prompt_tokens),
+                            num_samples=1,
+                            sampling_params=tinker.SamplingParams(max_tokens=1),
+                            include_prompt_logprobs=True,
+                        )
+                        assert sample_response.prompt_logprobs is not None
+                        for choice in args.messages_and_choices:
+                            if not isinstance(choice, Choice):
+                                continue
+                            if choice.logprobs is None:
+                                continue
+                            token_logprobs = (
+                                choice.logprobs.content or choice.logprobs.refusal or []
+                            )
+                            offset = choice_offsets.pop(0)
+                            for i, token_logprob in enumerate(token_logprobs):
+                                assert token_logprob.model_extra is not None
+                                if token_logprob.token.startswith("token_id:"):
+                                    assert (
+                                        int(token_logprob.token.split(":")[1])
+                                        == prompt_tokens[offset + i]
+                                    )
+                                token_logprob.model_extra.setdefault(
+                                    "extra_logprobs", {}
+                                )[alias or model] = sample_response.prompt_logprobs[
+                                    offset + i
+                                ]
+                        return CompletionUsage(
+                            completion_tokens=1,
+                            prompt_tokens=len(prompt_tokens),
+                            total_tokens=1 + len(prompt_tokens),
+                        )
+                except tinker.APIStatusError as e:
+                    error_body = e.body
+                    if isinstance(error_body, dict) and "detail" in error_body:
+                        detail = error_body["detail"]  # ty:ignore[invalid-argument-type]
+                    elif error_body is not None:
+                        detail = error_body
+                    else:
+                        detail = str(e)
+                    raise HTTPException(status_code=e.status_code, detail=detail) from e
+
+            usages = await asyncio.gather(
+                *[
+                    add_logprobs(model, args.model_aliases.get(model))
+                    for model in args.models
+                ]
+            )
+            return MessagesAndChoicesWithLogprobs(
+                messages_and_choices=args.messages_and_choices,
+                usages=usages,
+            )
 
         @app.get("/v1/models")
         async def list_models(request: Request) -> ModelList:
@@ -440,6 +533,31 @@ class OpenAICompatibleTinkerServerWorker:
             return encoding.input_ids
         else:
             return encoding  # type: ignore
+
+    async def messages_and_choices_prompt_tokens_and_choice_offsets(
+        self,
+        base_model: str,
+        messages_and_choices: WireMessagesAndChoices,
+        tools: Tools | None,
+    ) -> tuple[list[int], list[int]] | None:
+        from art.preprocessing.tokenize import tokenize_trajectory
+        from art.trajectories import History, Trajectory
+
+        result = tokenize_trajectory(
+            tokenizer=self._get_renderer(base_model).tokenizer,
+            image_processor=None,
+            history=History(
+                messages_and_choices=messages_and_choices,
+                tools=tools,
+            ),
+            advantage=0.0,
+            allow_training_without_logprobs=False,
+            trajectory=Trajectory(
+                messages_and_choices=messages_and_choices,
+                tools=tools,
+            ),
+        )
+        return (result.token_ids, result.choice_offsets) if result is not None else None
 
     async def chat_completion_and_token_discrepancies(
         self,

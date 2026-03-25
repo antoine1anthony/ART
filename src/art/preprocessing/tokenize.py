@@ -6,6 +6,7 @@ import math
 import random
 from typing import Any, Generator, cast
 
+from openai.types.chat.chat_completion import Choice
 from PIL import Image
 import torch
 from transformers.image_processing_utils import BaseImageProcessor
@@ -41,6 +42,8 @@ class TokenizedResult:
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     trajectory: Trajectory
+    choice_offsets: list[int]
+    extra_logprobs: dict[str, list[float]]
     _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
     weight: float = 0.0
     prompt_id: int = 0
@@ -63,6 +66,11 @@ class TokenizedResult:
             pixel_values=None,
             image_grid_thw=None,
             trajectory=self.trajectory,
+            choice_offsets=self.choice_offsets,
+            extra_logprobs={
+                key: values[self.prompt_length :]
+                for key, values in self.extra_logprobs.items()
+            },
             _tokenizer=self._tokenizer,
             weight=self.weight,
             prompt_id=self.prompt_id,
@@ -207,8 +215,8 @@ def tokenize_trajectory(
             and allow_training_without_logprobs
         ):
             last_assistant_index = i
-        elif not isinstance(message, dict) and (
-            message.logprobs or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
+        elif isinstance(message, Choice) and (
+            message.logprobs or allow_training_without_logprobs
         ):
             last_assistant_index = i
     # If there are no trainable assistant messages, return None
@@ -265,6 +273,8 @@ def tokenize_trajectory(
     )
     assistant_mask: list[int] = [0] * len(token_ids)
     logprobs = [float("nan")] * len(token_ids)
+    choice_offsets, choice_token_logprobs = [], []
+
     for message in messages_and_choices:
         if isinstance(message, dict):
             if message["role"] != "assistant":
@@ -304,12 +314,14 @@ def tokenize_trajectory(
             if not choice.logprobs:  # ty:ignore[possibly-missing-attribute]
                 continue
             token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []  # ty:ignore[possibly-missing-attribute]
-            if (
+            if token_logprobs and (
                 bytes(token_logprobs[0].bytes or []).decode("utf-8")
                 == "<think>"
                 == tokenizer.decode(token_ids[start - 4])
             ):
                 start -= 4
+            choice_offsets.append(start)
+            choice_token_logprobs.append(token_logprobs)
             try:
                 token_ids[start:end] = (
                     int(token_logprob.token.split(":")[1])
@@ -336,6 +348,18 @@ def tokenize_trajectory(
                 token_ids.pop(start + len(token_logprobs))
                 logprobs.pop(start + len(token_logprobs))
                 assistant_mask.pop(start + len(token_logprobs))
+    extra_logprobs: dict[str, list[float]] = {}
+    for start, token_logprobs in zip(choice_offsets, choice_token_logprobs):
+        for i, token_logprob in enumerate(token_logprobs):
+            token_extra_logprobs = (token_logprob.model_extra or {}).get(
+                "extra_logprobs"
+            )
+            if not isinstance(token_extra_logprobs, dict):
+                continue
+            for key, value in token_extra_logprobs.items():
+                extra_logprobs.setdefault(key, [float("nan")] * len(token_ids))[
+                    start + i
+                ] = float("nan") if value is None else float(value)
     if image_processor:
         images: list[Image.Image] = []
         for message in messages_and_choices:
@@ -369,6 +393,8 @@ def tokenize_trajectory(
                 token_ids[start:end] = [image_token_id] * num_image_tokens
                 logprobs[start:end] = [float("nan")] * num_image_tokens
                 assistant_mask[start:end] = [0] * num_image_tokens
+                for values in extra_logprobs.values():
+                    values[start:end] = [float("nan")] * num_image_tokens
             pixel_values = result["pixel_values"]
             image_grid_thw = result["image_grid_thw"]
         else:
@@ -387,6 +413,8 @@ def tokenize_trajectory(
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
         trajectory=trajectory,
+        choice_offsets=choice_offsets,
+        extra_logprobs=extra_logprobs,
         _tokenizer=tokenizer,
     )
 
