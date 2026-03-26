@@ -9,8 +9,13 @@ PYTHON_MM="${PYTHON_MM:-3.11}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
+AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-8}"
+UV_BUILD_SLOTS="${UV_BUILD_SLOTS:-2}"
+CI_APEX_PARALLEL_BUILD="${CI_APEX_PARALLEL_BUILD:-8}"
+CI_APEX_NVCC_THREADS="${CI_APEX_NVCC_THREADS:-1}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
+UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
 SKIP_BUILD=0
 SKIP_PRUNE=0
 ARCHIVE_PATH=""
@@ -111,6 +116,43 @@ require_cmd() {
   command -v "${cmd}" >/dev/null 2>&1 || fail "Required command not found: ${cmd}"
 }
 
+detect_mem_info() {
+  local out_source_var="$1"
+  local out_kib_var="$2"
+  local detected_source="proc_meminfo"
+  local detected_kib="0"
+
+  local cgroup_v2_mem_max="/sys/fs/cgroup/memory.max"
+  if [[ -r "${cgroup_v2_mem_max}" ]]; then
+    local cgroup_v2_value
+    cgroup_v2_value="$(<"${cgroup_v2_mem_max}")"
+    if [[ "${cgroup_v2_value}" =~ ^[0-9]+$ ]] && ((cgroup_v2_value > 0)); then
+      detected_source="cgroup_v2"
+      detected_kib="$((cgroup_v2_value / 1024))"
+      printf -v "${out_source_var}" '%s' "${detected_source}"
+      printf -v "${out_kib_var}" '%s' "${detected_kib}"
+      return
+    fi
+  fi
+
+  local cgroup_v1_mem_limit="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+  if [[ -r "${cgroup_v1_mem_limit}" ]]; then
+    local cgroup_v1_value
+    cgroup_v1_value="$(<"${cgroup_v1_mem_limit}")"
+    if [[ "${cgroup_v1_value}" =~ ^[0-9]+$ ]] && ((cgroup_v1_value > 0)); then
+      detected_source="cgroup_v1"
+      detected_kib="$((cgroup_v1_value / 1024))"
+      printf -v "${out_source_var}" '%s' "${detected_source}"
+      printf -v "${out_kib_var}" '%s' "${detected_kib}"
+      return
+    fi
+  fi
+
+  detected_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  printf -v "${out_source_var}" '%s' "${detected_source}"
+  printf -v "${out_kib_var}" '%s' "${detected_kib}"
+}
+
 compute_fingerprint() {
   python3 "${REPO_ROOT}/scripts/ci/compute_uv_fingerprint.py" \
     --pyproject "${REPO_ROOT}/pyproject.toml" \
@@ -131,8 +173,9 @@ resolve_build_jobs() {
 
   local cpu_count
   cpu_count="$(nproc 2>/dev/null || echo 1)"
+  local mem_source
   local mem_kib
-  mem_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  detect_mem_info mem_source mem_kib
   local mem_gib="$((mem_kib / 1024 / 1024))"
   local mem_limited_jobs=1
   if ((mem_gib > 0)); then
@@ -145,6 +188,18 @@ resolve_build_jobs() {
   if ((mem_limited_jobs > cpu_count)); then
     mem_limited_jobs="${cpu_count}"
   fi
+  if ! [[ "${AUTO_BUILD_JOBS_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    fail "AUTO_BUILD_JOBS_MAX must be a positive integer."
+  fi
+  if ((mem_limited_jobs > AUTO_BUILD_JOBS_MAX)); then
+    mem_limited_jobs="${AUTO_BUILD_JOBS_MAX}"
+  fi
+  printf '[ci-cache] Auto build jobs resolved: cpu_count=%s mem_source=%s mem_gib=%s cap=%s resolved=%s\n' \
+    "${cpu_count}" \
+    "${mem_source}" \
+    "${mem_gib}" \
+    "${AUTO_BUILD_JOBS_MAX}" \
+    "${mem_limited_jobs}" >&2
   printf '%s\n' "${mem_limited_jobs}"
 }
 
@@ -164,9 +219,40 @@ ensure_release_exists() {
     --notes "Managed cache assets for prek CI dependency bootstrap."
 }
 
+resolve_apex_parallel_build() {
+  local compile_jobs="$1"
+
+  [[ "${compile_jobs}" =~ ^[1-9][0-9]*$ ]] || fail "compile_jobs must be a positive integer."
+  [[ "${CI_APEX_PARALLEL_BUILD}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_PARALLEL_BUILD must be a positive integer."
+
+  local apex_parallel_build="${CI_APEX_PARALLEL_BUILD}"
+  if ((apex_parallel_build > compile_jobs)); then
+    apex_parallel_build="${compile_jobs}"
+  fi
+  printf '%s\n' "${apex_parallel_build}"
+}
+
+constrain_temp_pyproject_for_ci_build() {
+  local pyproject_path="$1"
+  local apex_parallel_build="$2"
+  local nvcc_threads="$3"
+
+  [[ -f "${pyproject_path}" ]] || fail "pyproject not found: ${pyproject_path}"
+  [[ "${apex_parallel_build}" =~ ^[1-9][0-9]*$ ]] || fail "apex_parallel_build must be a positive integer."
+  [[ "${nvcc_threads}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_NVCC_THREADS must be a positive integer."
+
+  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${apex_parallel_build}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
+  python3 "${SCRIPT_DIR}/apply_ci_uv_build_overrides.py" \
+    --pyproject "${pyproject_path}" \
+    --apex-parallel-build "${apex_parallel_build}" \
+    --apex-nvcc-threads "${nvcc_threads}"
+}
+
 build_cache_archive() {
   local archive_path="$1"
-  local jobs="$2"
+  local compile_jobs="$2"
+  local apex_parallel_build
+  apex_parallel_build="$(resolve_apex_parallel_build "${compile_jobs}")"
 
   TMP_DIR="$(mktemp -d)"
   UV_CACHE_DIR="${TMP_DIR}/uv-cache"
@@ -174,14 +260,16 @@ build_cache_archive() {
 
   cp "${REPO_ROOT}/pyproject.toml" "${TMP_DIR}/pyproject.toml"
   cp "${REPO_ROOT}/uv.lock" "${TMP_DIR}/uv.lock"
+  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${apex_parallel_build}" "${CI_APEX_NVCC_THREADS}"
 
   pushd "${TMP_DIR}" >/dev/null
   export UV_CACHE_DIR
   export UV_LINK_MODE=copy
-  export UV_CONCURRENT_BUILDS="${jobs}"
-  export CMAKE_BUILD_PARALLEL_LEVEL="${jobs}"
-  export MAX_JOBS="${jobs}"
-  export NINJAFLAGS="-j${jobs}"
+  [[ "${UV_BUILD_SLOTS}" =~ ^[1-9][0-9]*$ ]] || fail "UV_BUILD_SLOTS must be a positive integer."
+  export UV_CONCURRENT_BUILDS="${UV_BUILD_SLOTS}"
+  export CMAKE_BUILD_PARALLEL_LEVEL="${compile_jobs}"
+  export MAX_JOBS="${compile_jobs}"
+  export NINJAFLAGS="-j${compile_jobs}"
   export TORCH_CUDA_ARCH_LIST=8.0
 
   local cudnn_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
@@ -193,12 +281,13 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with ${jobs} parallel jobs."
+  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
   uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 
   log "Packing uv cache archive to ${archive_path}."
-  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T0 -o "${archive_path}"
+  rm -f "${archive_path}"
+  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T"${compile_jobs}" -f -o "${archive_path}"
   popd >/dev/null
 
   rm -rf "${TMP_DIR}"
@@ -251,6 +340,7 @@ upload_cache_assets() {
   if ((PART_SIZE_MB > 1900)); then
     fail "--part-size-mb must be <= 1900 to stay within GitHub release asset limits."
   fi
+  [[ "${UPLOAD_JOBS}" =~ ^[1-9][0-9]*$ ]] || fail "UPLOAD_JOBS must be a positive integer."
 
   delete_assets_for_fingerprint "${repo}" "${fingerprint}"
 
@@ -260,23 +350,32 @@ upload_cache_assets() {
   split --numeric-suffixes=0 --suffix-length=3 --bytes="${PART_SIZE_MB}m" "${archive_path}" "${split_prefix}"
 
   shopt -s nullglob
-  local part_count=0
   local chunk
-  for chunk in "${parts_dir}"/"${UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"*; do
-    local part_asset="${chunk##*/}"
-    log "Uploading cache part ${part_asset}."
-    gh release upload "${UV_CACHE_RELEASE_TAG}" \
-      --repo "${repo}" \
-      "${chunk}" \
-      --clobber
-    part_count=$((part_count + 1))
-  done
+  local parts=("${parts_dir}"/"${UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"*)
   shopt -u nullglob
 
+  local part_count="${#parts[@]}"
   if ((part_count == 0)); then
     rm -rf "${parts_dir}"
     fail "No cache parts produced from archive ${archive_path}."
   fi
+
+  local upload_jobs="${UPLOAD_JOBS}"
+  if ((upload_jobs > part_count)); then
+    upload_jobs="${part_count}"
+  fi
+
+  log "Uploading ${part_count} cache parts with ${upload_jobs} parallel upload jobs."
+  printf '%s\0' "${parts[@]}" | xargs -0 -n 1 -P "${upload_jobs}" sh -c '
+    chunk="$1"
+    part_asset="${chunk##*/}"
+    printf "[ci-cache] Uploading cache part %s\n" "${part_asset}"
+    gh release upload "'"${UV_CACHE_RELEASE_TAG}"'" \
+      --repo "'"${repo}"'" \
+      "${chunk}" \
+      --clobber
+  ' sh
+
   rm -rf "${parts_dir}"
   printf '%s\n' "${part_count}"
 }
